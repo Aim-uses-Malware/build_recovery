@@ -27,6 +27,18 @@ on:
         description: 'Specify your Device Path (Check the DEVICE_PATH in BoardConfig.mk)' # As is, just like your DEVICE_PATH in your BoardConfig.mk
         required: true
         default: 'device/device`s_company/Codename'
+      KERNEL_TREE:
+        description: 'Kernel Source Repo (leave empty if your device tree uses a prebuilt kernel)'
+        required: false
+        default: ''
+      KERNEL_TREE_BRANCH:
+        description: 'Kernel Source Branch (leave empty if not using KERNEL_TREE)'
+        required: false
+        default: ''
+      KERNEL_PATH:
+        description: 'Kernel Path inside source tree (must match TARGET_KERNEL_SOURCE in BoardConfig.mk, e.g. kernel/xiaomi/spes)'
+        required: false
+        default: ''
       BUILD_TARGET:
         description: 'Specify your Build Target' # The image suffix will be added later in build step.
         required: true
@@ -98,6 +110,12 @@ jobs:
         git clone ${{ inputs.DEVICE_TREE }} -b ${{ inputs.DEVICE_TREE_BRANCH }} ./${{ inputs.DEVICE_PATH }}
         cd ${{ inputs.DEVICE_PATH }}
         echo "COMMIT_ID=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+    - name: Clone Kernel Source
+      if: inputs.KERNEL_TREE != ''
+      run: |
+        cd ${{ env.ORANGEFOX_ROOT }}
+        git clone ${{ inputs.KERNEL_TREE }} -b ${{ inputs.KERNEL_TREE_BRANCH }} ./${{ inputs.KERNEL_PATH }}
 
     - name: Building OrangeFox
       run: |

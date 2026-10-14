@@ -1,0 +1,219 @@
+name: Build AERA Recovery (spes)
+
+# Put this file at: .github/workflows/build-aera-spes.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_url:
+        description: "Minimal manifest to sync the Android 16 build system from (VERIFY - see notes)"
+        required: true
+        default: "https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp"
+      manifest_branch:
+        description: "Manifest branch (VERIFY - must be the Android 16 / aera-16.0 compatible one)"
+        required: true
+        default: "twrp-16.0"
+      recovery_branch:
+        description: "AERA bootable/recovery branch"
+        required: true
+        default: "aera-16.0"
+      device_branch:
+        description: "Device tree branch"
+        required: true
+        default: "main"
+      kernel_repo:
+        description: "Kernel source repo for kernel/xiaomi/spes (leave empty if the device tree ships a prebuilt kernel)"
+        required: false
+        default: ""
+      kernel_branch:
+        description: "Kernel branch"
+        required: false
+        default: ""
+      lunch_target:
+        description: "Lunch target (leave empty to auto-try common aera_spes combos)"
+        required: false
+        default: ""
+      build_target:
+        description: "make target (recovery lives in boot on this device)"
+        required: true
+        default: "bootimage"
+      upload_release:
+        description: "Also publish the images as a GitHub release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  DEVICE: spes
+  DEVICE_VENDOR: xiaomi
+  RECOVERY_REPO: https://github.com/AERA-Recovery/android_bootable_recovery
+  DEVICE_REPO: https://github.com/Aim-uses-Malware/android_device_spes-AERA
+  TZ: UTC
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      - name: Add swap
+        run: |
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git git-lfs gnupg flex bison build-essential zip unzip curl wget rsync \
+            zlib1g-dev libc6-dev-i386 libncurses5 lib32z1-dev libgl1-mesa-dev \
+            libxml2-utils xsltproc fontconfig x11proto-core-dev libx11-dev \
+            python3 python-is-python3 bc lz4 ccache openssl libssl-dev \
+            cpio gawk lzop pngcrush schedtool squashfs-tools xmlstarlet \
+            ca-certificates
+          mkdir -p ~/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name  "github-actions"
+          git config --global user.email "github-actions@users.noreply.github.com"
+          git config --global color.ui false
+          git lfs install
+
+      - name: Init and sync manifest
+        run: |
+          mkdir -p ~/aera && cd ~/aera
+          repo init --depth=1 -u "${{ inputs.manifest_url }}" -b "${{ inputs.manifest_branch }}"
+          for i in 1 2 3; do
+            repo sync -c -j"$(nproc --all)" --force-sync --no-clone-bundle --no-tags && break
+            echo "repo sync failed (attempt $i), retrying..."; sleep 10
+          done
+
+      - name: Replace bootable/recovery with AERA
+        working-directory: /home/runner/aera
+        run: |
+          rm -rf bootable/recovery
+          git clone --depth=1 -b "${{ inputs.recovery_branch }}" "$RECOVERY_REPO" bootable/recovery
+
+      - name: Clone device tree
+        working-directory: /home/runner/aera
+        run: |
+          # DEVICE_PATH in BoardConfig.mk is device/xiaomi/spes
+          rm -rf "device/${DEVICE_VENDOR}/${DEVICE}"
+          git clone --depth=1 -b "${{ inputs.device_branch }}" "$DEVICE_REPO" "device/${DEVICE_VENDOR}/${DEVICE}"
+
+      - name: Clone kernel (if provided)
+        if: ${{ inputs.kernel_repo != '' }}
+        working-directory: /home/runner/aera
+        run: |
+          # TARGET_KERNEL_SOURCE / TARGET_KERNEL_HEADERS = kernel/xiaomi/spes
+          rm -rf "kernel/${DEVICE_VENDOR}/${DEVICE}"
+          BRANCH_ARG=""
+          if [ -n "${{ inputs.kernel_branch }}" ]; then BRANCH_ARG="-b ${{ inputs.kernel_branch }}"; fi
+          git clone --depth=1 $BRANCH_ARG "${{ inputs.kernel_repo }}" "kernel/${DEVICE_VENDOR}/${DEVICE}"
+
+      - name: Sanity-check sources
+        working-directory: /home/runner/aera
+        run: |
+          set -e
+          DT="device/${DEVICE_VENDOR}/${DEVICE}"
+          for f in BoardConfig.mk AndroidProducts.mk aera_spes.mk device.mk; do
+            [ -f "$DT/$f" ] || { echo "::error::Missing $DT/$f"; exit 1; }
+          done
+          [ -d bootable/recovery ] || { echo "::error::bootable/recovery missing"; exit 1; }
+          echo "--- AndroidProducts.mk ---"; cat "$DT/AndroidProducts.mk"
+          echo "--- vendorsetup.sh ---"; cat "$DT/vendorsetup.sh" || true
+
+          # The device tree builds the kernel in-tree by default (kernel/xiaomi/spes).
+          if [ ! -d "kernel/${DEVICE_VENDOR}/${DEVICE}" ] && [ ! -f "$DT/prebuilt/kernel" ]; then
+            echo "::error::No kernel found. Provide kernel_repo input (-> kernel/xiaomi/spes) or add a prebuilt kernel at $DT/prebuilt/kernel and set AERA_FORCE_PREBUILT_KERNEL + TARGET_PREBUILT_KERNEL in the tree (see BoardConfig.mk TODO)."
+            exit 1
+          fi
+
+      - name: Build
+        working-directory: /home/runner/aera
+        run: |
+          set +e
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export LC_ALL=C
+          export USE_CCACHE=1
+          export CCACHE_EXEC=/usr/bin/ccache
+          ccache -M 10G
+
+          source build/envsetup.sh
+
+          CANDIDATES=()
+          if [ -n "${{ inputs.lunch_target }}" ]; then CANDIDATES+=("${{ inputs.lunch_target }}"); fi
+          CANDIDATES+=(
+            aera_spes-eng
+            aera_spes-bp2a-eng aera_spes-bp3a-eng aera_spes-bp4a-eng aera_spes-bp1a-eng
+            aera_spes-trunk_staging-eng
+            aera_spes-userdebug
+          )
+
+          LUNCHED=""
+          for t in "${CANDIDATES[@]}"; do
+            echo "::group::lunch $t"
+            if lunch "$t"; then LUNCHED="$t"; echo "::endgroup::"; break; fi
+            echo "::endgroup::"
+          done
+          if [ -z "$LUNCHED" ]; then
+            echo "::error::No lunch target worked. Check the product name in AndroidProducts.mk / aera_spes.mk and pass it via lunch_target."
+            exit 1
+          fi
+          echo "Using lunch target: $LUNCHED"
+
+          mka ${{ inputs.build_target }} -j"$(nproc --all)"
+          exit $?
+
+      - name: Collect output
+        working-directory: /home/runner/aera
+        run: |
+          OUT="out/target/product/${DEVICE}"
+          mkdir -p ~/artifacts
+          ls -lh "$OUT"/*.img 2>/dev/null || true
+          cp -v "$OUT"/boot.img        ~/artifacts/ 2>/dev/null || true
+          cp -v "$OUT"/recovery.img    ~/artifacts/ 2>/dev/null || true
+          cp -v "$OUT"/vendor_boot.img ~/artifacts/ 2>/dev/null || true
+          cp -v "$OUT"/dtbo.img        ~/artifacts/ 2>/dev/null || true
+          if [ -z "$(ls -A ~/artifacts)" ]; then
+            echo "::error::No images were produced in $OUT"
+            exit 1
+          fi
+          cd ~/artifacts && sha256sum *.img > sha256sums.txt && cat sha256sums.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aera-recovery-${{ env.DEVICE }}-${{ github.run_number }}
+          path: /home/runner/artifacts/*
+          if-no-files-found: error
+
+      - name: Publish release
+        if: ${{ inputs.upload_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: aera-${{ env.DEVICE }}-${{ github.run_number }}
+          name: AERA Recovery ${{ env.DEVICE }} #${{ github.run_number }}
+          files: /home/runner/artifacts/*
+          body: |
+            AERA Recovery for Redmi Note 11 / 11 NFC (spes / spesn)
+            Recovery branch: ${{ inputs.recovery_branch }}
+            Device tree branch: ${{ inputs.device_branch }}

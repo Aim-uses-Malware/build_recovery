@@ -95,6 +95,11 @@ jobs:
           git config --global user.name  "github-actions"
           git config --global user.email "github-actions@users.noreply.github.com"
           git config --global color.ui false
+          # Manifests/projects sometimes use SSH URLs; the runner has no SSH key, so force HTTPS
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git://github.com/"
+          echo "GIT_TERMINAL_PROMPT=0" >> "$GITHUB_ENV"
           git lfs install
 
       - name: Init and sync manifest

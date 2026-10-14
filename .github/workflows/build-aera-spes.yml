@@ -103,6 +103,30 @@ jobs:
             "$DEVICE_REPO" "$DEVICE_PATH"
           ls "$DEVICE_PATH"
 
+      # Fixes "Building a 32-bit-app-only product on a 64-bit device".
+      # Idempotent: does nothing once core_64_bit.mk is inherited in the
+      # device tree itself, so it is safe to leave in or delete afterwards.
+      - name: Ensure product inherits core_64_bit.mk
+        working-directory: /mnt/build
+        run: |
+          for f in "$DEVICE_PATH"/*_spes.mk; do
+            [ -f "$f" ] || continue
+            if grep -q 'core_64_bit' "$f"; then
+              echo "$f already inherits core_64_bit.mk"
+            else
+              sed -i '0,/inherit-product, vendor\//s##inherit-product, $(SRC_TARGET_DIR)/product/core_64_bit.mk)\n$(call &#' "$f"
+              echo "Patched $f"
+            fi
+            grep -n 'inherit-product' "$f"
+          done
+
+      - name: Debug product layout
+        working-directory: /mnt/build
+        run: |
+          echo "--- vendor/ ---";            ls vendor/
+          echo "--- AndroidProducts.mk ---"; cat "$DEVICE_PATH/AndroidProducts.mk" || true
+          echo "--- release configs ---";    ls build/release/release_configs | head -20 || true
+
       - name: Build recovery
         working-directory: /mnt/build
         run: |
@@ -110,9 +134,9 @@ jobs:
           ccache -M 20G
           export ALLOW_MISSING_DEPENDENCIES=true
           export LC_ALL=C
-          set +e
           source build/envsetup.sh
-          lunch "${{ inputs.lunch_target }}"
+          lunch "${{ inputs.lunch_target }}" || { echo "::error::lunch failed"; exit 1; }
+          set +e
           ${{ inputs.build_command }}
           status=$?
           ccache -s

@@ -13,12 +13,18 @@ on:
       device_branch:
         description: Device tree branch
         default: main
+      kernel_repo:
+        description: Kernel source (owner/name), cloned to kernel/xiaomi/spes. Leave empty if the tree uses a prebuilt kernel.
+        default: ''
+      kernel_branch:
+        description: Kernel branch (empty = repo default branch)
+        default: ''
       lunch_target:
-        description: Lunch target (check AndroidProducts.mk / vendorsetup.sh in the log if it fails)
+        description: Lunch target (PRODUCT_NAME in twrp_spes.mk is twrp_spes)
         default: twrp_spes-bp2a-eng
       make_targets:
-        description: Targets passed to mka
-        default: adbd recoveryimage
+        description: Targets passed to mka (spes has no recovery partition, recovery is built into boot.img)
+        default: adbd recoveryimage bootimage
 
 permissions:
   contents: read
@@ -67,6 +73,25 @@ jobs:
           git config --global user.email "actions@users.noreply.github.com"
           git config --global color.ui false
 
+      - name: Check device tree and kernel repos exist
+        env:
+          DEVICE_REPO: ${{ inputs.device_repo }}
+          DEVICE_BRANCH: ${{ inputs.device_branch }}
+          KERNEL_REPO: ${{ inputs.kernel_repo }}
+          KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+        run: |
+          export GIT_TERMINAL_PROMPT=0
+          if ! git ls-remote --exit-code --heads "https://github.com/${DEVICE_REPO}.git" "$DEVICE_BRANCH" > /dev/null; then
+            echo "::error::Device tree ${DEVICE_REPO} (branch ${DEVICE_BRANCH}) not found"
+            exit 1
+          fi
+          if [ -n "$KERNEL_REPO" ]; then
+            if ! git ls-remote --exit-code "https://github.com/${KERNEL_REPO}.git" "${KERNEL_BRANCH:-HEAD}" > /dev/null; then
+              echo "::error::Kernel ${KERNEL_REPO} (${KERNEL_BRANCH:-default branch}) not found or not public"
+              exit 1
+            fi
+          fi
+
       - name: Set up SSH access to the AERA org
         env:
           AERA_SSH_KEY: ${{ secrets.AERA_SSH_KEY }}
@@ -106,15 +131,30 @@ jobs:
           done
           test "$synced" = 1
 
-      - name: Clone device tree
+      - name: Clone device tree and kernel
         env:
           DEVICE_REPO: ${{ inputs.device_repo }}
           DEVICE_BRANCH: ${{ inputs.device_branch }}
+          KERNEL_REPO: ${{ inputs.kernel_repo }}
+          KERNEL_BRANCH: ${{ inputs.kernel_branch }}
         run: |
           cd "$GITHUB_WORKSPACE/aera"
+          # The path matters: twrp_spes.mk derives the brand from device/<brand>/spes,
+          # and vendorsetup.sh only activates inside a directory named "spes".
           git clone --depth=1 -b "$DEVICE_BRANCH" "https://github.com/${DEVICE_REPO}.git" "$DEVICE_PATH"
+
+          if [ -n "$KERNEL_REPO" ]; then
+            git clone --depth=1 ${KERNEL_BRANCH:+-b "$KERNEL_BRANCH"} \
+              "https://github.com/${KERNEL_REPO}.git" kernel/xiaomi/spes
+          fi
+
           echo "::group::AndroidProducts.mk"; cat "$DEVICE_PATH/AndroidProducts.mk" || true; echo "::endgroup::"
-          echo "::group::vendorsetup.sh"; cat "$DEVICE_PATH/vendorsetup.sh" || true; echo "::endgroup::"
+          echo "::group::Kernel / boot lines in BoardConfig.mk"
+          grep -nE 'KERNEL|RECOVERY_AS_BOOT|BOOT_HEADER' "$DEVICE_PATH/BoardConfig.mk" || true
+          echo "::endgroup::"
+          if [ ! -d kernel/xiaomi/spes ]; then
+            echo "::warning::kernel/xiaomi/spes is missing. aera_spes.mk builds the kernel in-tree from there unless AERA_FORCE_PREBUILT_KERNEL is set. Use the kernel_repo input if the build fails at the kernel step."
+          fi
 
       - name: Restore ccache
         uses: actions/cache@v4
